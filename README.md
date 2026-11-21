@@ -147,9 +147,9 @@ flowchart TB
 
 <div align="center">
 
-| 📦 Model size | ⚡ S3 prefetch | ⏱️ Full startup | 🔤 Generation | 💵 Running cost |
+| 📦 Model size | ⚡ S3 prefetch | ⏱️ Full startup | 💵 Running cost |
 |:---:|:---:|:---:|:---:|:---:|
-| **7.5 GB** | **155 s** | **~11.5 min** | **~3.6 tok/s** | **~$0.70 / h** |
+| **7.5 GB** | **155 s** | **~11.5 min** | **~$0.70 / h** |
 | Qwen3-4B, BF16 | all weights | pod start → API ready | 1 user, CPU | everything running |
 
 </div>
