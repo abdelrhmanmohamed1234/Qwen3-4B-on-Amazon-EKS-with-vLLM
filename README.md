@@ -1,12 +1,82 @@
-# Qwen3-4B on Amazon EKS with vLLM
+<div align="center">
 
-Self-hosted, OpenAI-compatible LLM API and chat UI on Kubernetes: **Qwen3-4B-Instruct** served by **vLLM** on **Amazon EKS**, provisioned with **Terraform**, and monitored with **Prometheus + Grafana**.
+# 🚀 Qwen3-4B on Amazon EKS with vLLM
 
-> **Current phase: CPU inference.** The AWS account's GPU quota request is pending, so vLLM runs on an Intel `m7i.2xlarge` (AMX/AVX-512). The GPU path (`g6.xlarge`, NVIDIA L4) is already prepared for when the quota is approved.
+**A self-hosted, OpenAI-compatible LLM API and chat UI on Kubernetes**
+**Provisioned with Terraform · Served by vLLM · Monitored with Prometheus & Grafana**
+
+![AWS](https://img.shields.io/badge/AWS-us--east--1-FF9900?style=for-the-badge&logoColor=white)
+![Amazon EKS](https://img.shields.io/badge/Amazon%20EKS-Kubernetes-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white)
+![Terraform](https://img.shields.io/badge/Terraform-IaC-844FBA?style=for-the-badge&logo=terraform&logoColor=white)
+![Helm](https://img.shields.io/badge/Helm-Charts-0F1689?style=for-the-badge&logo=helm&logoColor=white)
+
+![vLLM](https://img.shields.io/badge/vLLM-0.29-30A2FF?style=for-the-badge)
+![Qwen](https://img.shields.io/badge/Qwen3--4B-Instruct-6950EF?style=for-the-badge&logo=qwen&logoColor=white)
+![Open WebUI](https://img.shields.io/badge/Open%20WebUI-Chat%20UI-000000?style=for-the-badge)
+![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-E6522C?style=for-the-badge&logo=prometheus&logoColor=white)
+![Grafana](https://img.shields.io/badge/Grafana-Dashboards-F46800?style=for-the-badge&logo=grafana&logoColor=white)
+
+[Architecture](#-architecture) •
+[Highlights](#-highlights) •
+[Results](#-results) •
+[Components](#-components) •
+[How to run](#-how-to-run) •
+[Lessons learned](#-problems-solved-along-the-way) •
+[Roadmap](#-roadmap)
+
+</div>
 
 ---
 
-## Architecture
+> [!NOTE]
+> **Current phase: CPU inference.** The AWS account's GPU quota request is pending, so vLLM runs on an Intel `m7i.2xlarge` (AMX / AVX-512).
+> The GPU path (`g6.xlarge`, NVIDIA L4) is already prepared for when the quota is approved.
+
+## 🏗️ Architecture
+
+<p align="center">
+  <img src="docs/qwen-eks-vllm-architecture.gif" alt="Qwen3-4B on Amazon EKS with vLLM - architecture" width="100%">
+</p>
+
+<p align="center">
+  <sub>Editable source: <a href="docs/qwen-eks-vllm-architecture.drawio"><code>docs/qwen-eks-vllm-architecture.drawio</code></a> (open in <a href="https://app.diagrams.net">draw.io</a>)</sub>
+</p>
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🔵 Request path
+```
+Browser
+  → ALB (Ingress)
+  → Open WebUI (login)
+  → vllm Service (ClusterIP)
+  → vLLM pod
+  → response
+```
+vLLM is **never exposed to the internet**. Users reach it only through Open WebUI's authentication.
+
+</td>
+<td width="50%" valign="top">
+
+### 🟢 Model path
+```
+Hugging Face
+  → download Job (once)
+  → S3 bucket
+  → S3 Gateway Endpoint
+  → Mountpoint S3 CSI (/models)
+  → vLLM (RAM)
+```
+The bucket lives in a separate Terraform stack, so the **7.5 GB model survives `terraform destroy`**.
+
+</td>
+</tr>
+</table>
+
+<details>
+<summary><b>📄 Text version of the diagram (Mermaid)</b></summary>
 
 ```mermaid
 flowchart TB
@@ -18,67 +88,90 @@ flowchart TB
         sm["Secrets Manager<br/>HF token"]
         s3m[("S3: model weights")]
         s3s[("S3: Terraform state")]
-        budget["AWS Budgets<br/>cost alerts"]
 
         subgraph vpc["VPC 10.0.0.0/16 · 2 AZs"]
             subgraph pub["Public subnets"]
                 igw["Internet Gateway"]
-                alb["ALB (Ingress)<br/>AWS Load Balancer Controller"]
-                nat["NAT Gateway (single)"]
+                alb["ALB (Ingress)"]
+                nat["NAT Gateway"]
             end
-
             subgraph priv["Private subnets"]
                 subgraph eks["EKS cluster"]
                     subgraph sys["System node group · t3.large"]
-                        owui["Open WebUI<br/>(EBS gp3 volume)"]
+                        owui["Open WebUI"]
                         prom["Prometheus"]
                         graf["Grafana"]
-                        lbc["LB Controller"]
                         job["Model download Job"]
                     end
                     subgraph inf["Inference node group · m7i.2xlarge · 0↔1"]
-                        vllm["vLLM (CPU)<br/>Qwen3-4B · BF16<br/>OpenAI API :8000"]
-                        mp["Mountpoint S3 CSI<br/>/models (read-only)"]
+                        vllm["vLLM (CPU) · Qwen3-4B"]
+                        mp["Mountpoint S3 CSI"]
                     end
                 end
             end
-            s3ep["S3 Gateway Endpoint<br/>(free, bypasses NAT)"]
+            s3ep["S3 Gateway Endpoint"]
         end
     end
 
     user -->|HTTP| igw --> alb --> owui
-    owui -->|"/v1/chat/completions<br/>(in-cluster Service)"| vllm
-    mp -->|weights| vllm
+    owui -->|/v1/chat/completions| vllm
+    mp --> vllm
     s3m --> s3ep --> mp
-    hf --> job
-    sm -->|token via Pod Identity| job
-    job --> s3ep
-    prom -.->|scrape /metrics| vllm
+    hf --> job --> s3ep
+    sm -->|Pod Identity| job
+    prom -.->|/metrics| vllm
     graf -.-> prom
-
     dev -->|terraform apply| eks
-    dev -.->|state| s3s
+    dev -.-> s3s
 ```
 
-### Request path
-`Browser → ALB (Ingress) → Open WebUI (login) → vllm Service (ClusterIP) → vLLM pod → response`
-
-vLLM itself is **never exposed to the internet**; users reach it only through Open WebUI's authentication.
-
-### Model path
-`Hugging Face → download Job (once) → S3 bucket → Mountpoint S3 CSI → /models in the vLLM pod → RAM`
-
-The bucket lives in a separate Terraform stack, so the 7.5 GB model survives `terraform destroy`.
+</details>
 
 ---
 
-## Components
+## ✨ Highlights
+
+| | |
+|---|---|
+| 🧱 **Infrastructure as Code** | Two Terraform stacks with an S3 backend and native state locking |
+| ☸️ **Production-style EKS** | Private subnets, two managed node groups, Pod Identity + IRSA, EBS & Mountpoint CSI add-ons |
+| 🤖 **OpenAI-compatible API** | vLLM with API key auth and tool calling, behind an internal ClusterIP Service |
+| 💬 **Public chat UI** | Open WebUI behind an ALB Ingress; new sign-ups need admin approval |
+| 📦 **Model in S3, not in images** | Downloaded once, mounted read-only with Mountpoint; traffic bypasses the NAT |
+| 📊 **Observability** | kube-prometheus-stack + the official vLLM Grafana dashboard (TTFT, ITL, tokens/s, KV cache) |
+| 💰 **Cost-aware** | Inference node scales 0 ↔ 1, the cluster is destroyed after each session, AWS Budgets alerts |
+
+---
+
+## 📈 Results
+
+<div align="center">
+
+| 📦 Model size | ⚡ S3 prefetch | ⏱️ Full startup | 🔤 Generation | 💵 Running cost |
+|:---:|:---:|:---:|:---:|:---:|
+| **7.5 GB** | **155 s** | **~11.5 min** | **~3.6 tok/s** | **~$0.70 / h** |
+| Qwen3-4B, BF16 | all weights | pod start → API ready | 1 user, CPU | everything running |
+
+</div>
+
+| Metric | Value |
+|---|---|
+| Model | Qwen3-4B-Instruct-2507, BF16, 7.49 GiB |
+| Weight read from S3, default mmap | ~7.3 min per 3.7 GB shard (startup probe killed it at 15 min) |
+| Weight read from S3, `--safetensors-load-strategy=prefetch` | **155 s for all weights (~6× faster)** |
+| Full startup (pod start → API ready) | ~11.5 min |
+| Generation speed, 1 user | ~3.6 tokens/s |
+| Compute threads | 3 OpenMP threads (4 physical cores, 1 reserved) |
+
+---
+
+## 🧩 Components
 
 | Layer | Technology | Notes |
 |---|---|---|
 | Infrastructure as Code | Terraform (2 stacks, S3 backend with native locking) | `persistent` (bucket, secret, budget) and `dev` (VPC, EKS, IAM) |
 | Network | VPC module, 2 AZs, single NAT, S3 Gateway Endpoint | model traffic skips NAT data charges |
-| Kubernetes | Amazon EKS, 2 managed node groups | `system` (t3.large, always on), `inference` (m7i.2xlarge, scaled 0↔1) |
+| Kubernetes | Amazon EKS, 2 managed node groups | `system` (t3.large, always on), `inference` (m7i.2xlarge, scaled 0 ↔ 1) |
 | Identity | EKS Pod Identity + IRSA | least-privilege roles per workload; no keys in pods |
 | Model storage | S3 + Mountpoint for Amazon S3 CSI driver | static `ReadOnlyMany` volume |
 | Serving | vLLM 0.29 (CPU build) | OpenAI-compatible API, API key, tool calling (`hermes` parser) |
@@ -89,10 +182,23 @@ The bucket lives in a separate Terraform stack, so the 7.5 GB model survives `te
 
 ---
 
-## Repository structure
+## 🧠 Key design decisions
+
+- **Two Terraform stacks.** Long-lived data (model, secret, budget) is separated from the per-session environment, so `destroy` never deletes the model.
+- **Weights in S3, mounted with Mountpoint.** One download from Hugging Face, then every new pod reads from S3. The S3 Gateway Endpoint keeps that traffic off the NAT.
+- **Scale-to-zero inference node.** The expensive node runs only during a session; the cluster itself is destroyed after use.
+- **vLLM stays internal.** Only Open WebUI is public; the API key and in-cluster Service protect the model endpoint.
+- **Pod-level identity.** The downloader can write to the bucket and read one secret; the S3 driver can only read; nothing else gets AWS permissions.
+
+---
+
+## 📁 Repository structure
 
 ```
 .
+├── docs/
+│   ├── qwen-eks-vllm-architecture.gif      # animated architecture diagram
+│   └── qwen-eks-vllm-architecture.drawio   # editable source
 ├── terraform/
 │   ├── persistent/     # model bucket, HF token secret, budget
 │   └── envs/dev/       # VPC, EKS, node groups, add-ons, IAM, LB controller role
@@ -108,32 +214,35 @@ The bucket lives in a separate Terraform stack, so the 7.5 GB model survives `te
 
 ---
 
-## Key design decisions
+## 🛠️ How to run
 
-- **Two Terraform stacks.** Long-lived data (model, secret, budget) is separated from the per-session environment, so `destroy` never deletes the model.
-- **Weights in S3, mounted with Mountpoint.** One download from Hugging Face, then every new pod reads from S3. The S3 Gateway Endpoint keeps that traffic off the NAT.
-- **Scale-to-zero inference node.** The expensive node runs only during a session; the cluster itself is destroyed after use.
-- **vLLM stays internal.** Only Open WebUI is public; the API key and in-cluster Service protect the model endpoint.
-- **Pod-level identity.** The downloader can write to the bucket and read one secret; the S3 driver can only read; nothing else gets AWS permissions.
+> Full commands are in **[RUNBOOK.md](RUNBOOK.md)**.
+
+**Prerequisites:** AWS CLI, Terraform ≥ 1.10, kubectl, Helm, and an AWS account with an `m7i.2xlarge`-sized On-Demand Standard quota (≥ 10 vCPU).
+
+```bash
+# 1. Long-lived resources (once): model bucket, HF token secret, budget
+cd terraform/persistent && terraform init && terraform apply
+
+# 2. Store the Hugging Face token
+aws secretsmanager put-secret-value --secret-id qwen-eks/hf-token --secret-string "$HF_TOKEN"
+
+# 3. The environment: VPC + EKS (~15-20 min)
+cd ../envs/dev && terraform init && terraform apply
+aws eks update-kubeconfig --region us-east-1 --name qwen-eks
+
+# 4. Kubernetes: LB controller, model, vLLM, Open WebUI, monitoring
+#    → follow RUNBOOK.md steps 2-7
+```
+
+Then open the ALB URL, create the admin account and chat with **`qwen3-4b`**.
+
+> [!WARNING]
+> **Teardown order matters.** Delete the Ingress and Open WebUI first (they create the ALB and an EBS volume outside Terraform), then run `terraform destroy`.
 
 ---
 
-## Results (CPU phase, `m7i.2xlarge`)
-
-| Metric | Value |
-|---|---|
-| Model | Qwen3-4B-Instruct-2507, BF16, 7.49 GiB |
-| Weight read from S3, default mmap | ~7.3 min per 3.7 GB shard (startup probe killed it at 15 min) |
-| Weight read from S3, `--safetensors-load-strategy=prefetch` | 155 s for all weights (~6× faster) |
-| Full startup (pod start → API ready) | ~11.5 min |
-| Generation speed, 1 user | ~3.6 tokens/s |
-| Compute threads | 3 OpenMP threads (4 physical cores, 1 reserved) |
-
-Multi-user benchmarks and the GPU comparison (`g6.xlarge`, NVIDIA L4): *in progress*.
-
----
-
-## Problems solved along the way
+## 🧯 Problems solved along the way
 
 | Problem | Cause | Fix |
 |---|---|---|
@@ -147,7 +256,7 @@ Multi-user benchmarks and the GPU comparison (`g6.xlarge`, NVIDIA L4): *in progr
 
 ---
 
-## Cost
+## 💵 Cost
 
 | Item | Approx. per hour (us-east-1) |
 |---|---|
@@ -162,22 +271,22 @@ Everything except the S3 bucket and the secret is destroyed after each session. 
 
 ---
 
-## How to run
+## 🗺️ Roadmap
 
-Full commands are in **[RUNBOOK.md](RUNBOOK.md)**. In short:
-
-1. `terraform/persistent`: `terraform apply` once.
-2. Store the Hugging Face token in Secrets Manager.
-3. `terraform apply` in `terraform/envs/dev`, then the Helm and `kubectl` steps in the runbook.
-4. Open the ALB URL, create the admin account, chat with `qwen3-4b`.
-5. Ordered teardown at the end of the session: delete the Ingress and Open WebUI, then `terraform destroy`.
+- [x] Terraform: VPC, EKS, IAM, S3, Secrets Manager, Budgets
+- [x] vLLM serving Qwen3-4B on CPU with S3-mounted weights
+- [x] Open WebUI behind a public ALB
+- [x] Prometheus + Grafana with the vLLM dashboard
+- [ ] GPU node group (`g6.xlarge`, NVIDIA L4) once the quota is approved; CPU vs GPU table
+- [ ] Faster startup: initContainer copies weights to local disk before vLLM starts
+- [ ] HTTPS with a domain + ACM certificate
 
 ---
 
-## Roadmap
+<div align="center">
 
-- [ ] Benchmarks with `vllm bench serve` (1 / 4 / 8 concurrent users)
-- [ ] GPU node group (`g6.xlarge`, L4) once the quota is approved; CPU vs GPU table
-- [ ] Faster startup: initContainer copies weights to local disk before vLLM starts
-- [ ] CI/CD with GitHub Actions (OIDC, no stored AWS keys)
-- [ ] HTTPS with a domain + ACM certificate
+**Built by [Abdelrhaman Awad](https://github.com/abdelrhmanmohamed1234)** · LLMOps & AI Infrastructure
+
+⭐ If this project helped you, consider giving it a star!
+
+</div>
